@@ -9,20 +9,115 @@ For the installation and maintenance, we assume you have some knowledge of GitHu
     If you're just looking for the SAM script - you can find it below:
 
     ```powershell
-    # Fill these in with the details of your Azure AD application.
-    $ApplicationID = 'ApplicationID'
-    $ApplicationSecret = 'Secret' | Convertto-SecureString -AsPlainText -Force
-    $TenantID = 'YourTenantID'
-    # You don't need to change anything below here.
-    $Credential = New-Object System.Management.Automation.PSCredential($ApplicationId, $ApplicationSecret)
-    $token = New-PartnerAccessToken -ApplicationId $ApplicationID -Scopes 'https://api.partnercenter.microsoft.com/user_impersonation' -ServicePrincipal -Credential $Credential -Tenant $TenantID -UseAuthorizationCode
-    $Exchangetoken = New-PartnerAccessToken -ApplicationId 'a0c73c16-a7e3-4564-9a95-2bdf47383716' -Scopes 'https://outlook.office365.com/.default' -Tenant $TenantID -UseDeviceAuthentication
+    Param
+    ( 
+        [Parameter(Mandatory = $false)]
+        [switch]$ConfigurePreconsent,
+        [Parameter(Mandatory = $true)]
+        [string]$DisplayName,
+        [Parameter(Mandatory = $false)]
+        [string]$TenantId
+    )
+    
+    $ErrorActionPreference = "Stop"
+    
+    # Check if the Azure AD PowerShell module has already been loaded.
+    if ( ! ( Get-Module AzureAD ) ) {
+        # Check if the Azure AD PowerShell module is installed.
+        if ( Get-Module -ListAvailable -Name AzureAD ) {
+            # The Azure AD PowerShell module is not load and it is installed. This module
+            # must be loaded for other operations performed by this script.
+            Write-Host -ForegroundColor Green "Loading the Azure AD PowerShell module..."
+            Import-Module AzureAD
+        } else {
+            Install-Module AzureAD
+        }
+    }
+    
+    try {
+        Write-Host -ForegroundColor Green "When prompted please enter the appropriate credentials... Warning: Window might have pop-under in VSCode"
+    
+        if([string]::IsNullOrEmpty($TenantId)) {
+            Connect-AzureAD | Out-Null
+    
+            $TenantId = $(Get-AzureADTenantDetail).ObjectId
+        } else {
+            Connect-AzureAD -TenantId $TenantId | Out-Null
+        }
+    } catch [Microsoft.Azure.Common.Authentication.AadAuthenticationCanceledException] {
+        # The authentication attempt was canceled by the end-user. Execution of the script should be halted.
+        Write-Host -ForegroundColor Yellow "The authentication attempt was canceled. Execution of the script will be halted..."
+        Exit
+    } catch {
+        # An unexpected error has occurred. The end-user should be notified so that the appropriate action can be taken.
+        Write-Error "An unexpected error has occurred. Please review the following error message and try again." `
+            "$($Error[0].Exception)"
+    }
+    
+    $adAppAccess = [Microsoft.Open.AzureAD.Model.RequiredResourceAccess]@{
+        ResourceAppId = "00000002-0000-0000-c000-000000000000";
+        ResourceAccess =
+        [Microsoft.Open.AzureAD.Model.ResourceAccess]@{
+            Id = "5778995a-e1bf-45b8-affa-663a9f3f4d04";
+            Type = "Role"},
+        [Microsoft.Open.AzureAD.Model.ResourceAccess]@{
+            Id = "a42657d6-7f20-40e3-b6f0-cee03008a62a";
+            Type = "Scope"},
+        [Microsoft.Open.AzureAD.Model.ResourceAccess]@{
+            Id = "311a71cc-e848-46a1-bdf8-97ff7156d8e6";
+            Type = "Scope"}
+    }
+    
+    $graphAppAccess = [Microsoft.Open.AzureAD.Model.RequiredResourceAccess]@{
+        ResourceAppId = "00000003-0000-0000-c000-000000000000";
+        ResourceAccess =
+            [Microsoft.Open.AzureAD.Model.ResourceAccess]@{
+                Id = "bf394140-e372-4bf9-a898-299cfc7564e5";
+                Type = "Role"},
+            [Microsoft.Open.AzureAD.Model.ResourceAccess]@{
+                Id = "7ab1d382-f21e-4acd-a863-ba3e13f7da61";
+                Type = "Role"}
+    }
+    
+    $partnerCenterAppAccess = [Microsoft.Open.AzureAD.Model.RequiredResourceAccess]@{
+        ResourceAppId = "fa3d9a0c-3fb0-42cc-9193-47c7ecd2edbd";
+        ResourceAccess =
+            [Microsoft.Open.AzureAD.Model.ResourceAccess]@{
+                Id = "1cebfa2a-fb4d-419e-b5f9-839b4383e05a";
+                Type = "Scope"}
+    }
+    
+    $SessionInfo = Get-AzureADCurrentSessionInfo
+    
+    Write-Host -ForegroundColor Green "Creating the Azure AD application and related resources..."
+    
+    $app = New-AzureADApplication -AvailableToOtherTenants $true -DisplayName $DisplayName -IdentifierUris "https://$($SessionInfo.TenantDomain)/$((New-Guid).ToString())" -RequiredResourceAccess $adAppAccess, $graphAppAccess, $partnerCenterAppAccess -ReplyUrls @("urn:ietf:wg:oauth:2.0:oob","https://login.microsoftonline.com/organizations/oauth2/nativeclient","https://localhost","http://localhost","http://localhost:8400")
+    $password = New-AzureADApplicationPasswordCredential -ObjectId $app.ObjectId
+    $spn = New-AzureADServicePrincipal -AppId $app.AppId -DisplayName $DisplayName
+    
+    
+        $adminAgentsGroup = Get-AzureADGroup -Filter "DisplayName eq 'AdminAgents'"
+        Add-AzureADGroupMember -ObjectId $adminAgentsGroup.ObjectId -RefObjectId $spn.ObjectId
+    
+    write-host "Installing PartnerCenter Module." -ForegroundColor Green
+    install-module PartnerCenter -Force
+    write-host "Sleeping for 30 seconds to allow app creation on O365" -foregroundcolor green
+    start-sleep 30
+    write-host "Please approve General consent form." -ForegroundColor Green
+    $PasswordToSecureString = $password.value | ConvertTo-SecureString -asPlainText -Force
+    $credential = New-Object System.Management.Automation.PSCredential($($app.AppId),$PasswordToSecureString)
+    $token = New-PartnerAccessToken -ApplicationId "$($app.AppId)" -Scopes 'https://api.partnercenter.microsoft.com/user_impersonation' -ServicePrincipal -Credential $credential -Tenant $($spn.AppOwnerTenantID) -UseAuthorizationCode
+    write-host "Please approve Exchange consent form." -ForegroundColor Green
+    $Exchangetoken = New-PartnerAccessToken -ApplicationId 'a0c73c16-a7e3-4564-9a95-2bdf47383716' -Scopes 'https://outlook.office365.com/.default' -Tenant $($spn.AppOwnerTenantID) -UseDeviceAuthentication
+    write-host "Last initation required: Please browse to https://login.microsoftonline.com/$($spn.AppOwnerTenantID)/adminConsent?client_id=$($app.AppId)"
+    write-host "Press any key after auth. An error report about incorrect URIs is expected!"
+    [void][System.Console]::ReadKey($true)
     Write-Host "================ Secrets ================"
-    Write-Host "`$ApplicationID         = $($ApplicationID)"
-    Write-Host "`$ApplicationSecret     = $($ApplicationSecret)"
-    Write-Host "`$TenantID              = $($TenantID)"
-    Write-Host "`$RefreshToken          = $($token.RefreshToken)" -ForegroundColor Blue
-    Write-Host "`$ExchangeRefreshToken  = $($ExchangeToken.Refreshtoken)" -ForegroundColor Green
+    Write-Host "`$ApplicationId         = $($app.AppId)"
+    Write-Host "`$ApplicationSecret     = $($password.Value)"
+    Write-Host "`$TenantID              = $($spn.AppOwnerTenantID)"
+    write-host "`$RefreshToken          = $($token.refreshtoken)" -ForegroundColor Blue
+    write-host "`$Exchange RefreshToken = $($ExchangeToken.Refreshtoken)" -ForegroundColor Green
     Write-Host "================ Secrets ================"
     Write-Host "    SAVE THESE IN A SECURE LOCATION     "
     ```
@@ -47,135 +142,135 @@ For full functionality, you'll need the following permissions for your Secure Ap
 
 ### Delegated Permissions
 
-You'll need to add the following **Delegated permissions**:
+??? note "You'll need to add the following **Delegated permissions**:"
+    | API / Permissions name                                  | Description                                                       |
+    | ------------------------------------------------------- | ----------------------------------------------------------------- |
+    | Application.Read.All                                    | Read applications                                                 |
+    | Application.ReadWrite.All                               | Read and write all applications                                   |
+    | AuditLog.Read.All                                       | Read audit log data                                               |
+    | Channel.Create                                          | Create channels                                                   |
+    | Channel.ReadBasic.All                                   | Read the names and descriptions of channels                       |
+    | ChannelMember.Read.All                                  | Read the members of channels                                      |
+    | ChannelMember.ReadWrite.All                             | Add and remove members from channels                              |
+    | ChannelMessage.Delete                                   | Delete users' channel messages                                    |
+    | ChannelMessage.Edit                                     | Edit users' channel messages                                      |
+    | ChannelMessage.Read.All                                 | Read users' channel messages                                      |
+    | ChannelMessage.Send                                     | Send channel messages                                             |
+    | ChannelSettings.Read.All                                | Read the names, descriptions, and settings of channels            |
+    | ChannelSettings.ReadWrite.All                           | Read and write the names, descriptions, and settings of channels  |
+    | ConsentRequest.Read.All                                 | Read consent requests                                             |
+    | Device.Command                                          | Communicate with user devices                                     |
+    | Device.Read                                             | Read user devices                                                 |
+    | Device.Read.All                                         | Read all devices                                                  |
+    | DeviceManagementApps.ReadWrite.All                      | Read and write Microsoft Intune apps                              |
+    | DeviceManagementConfiguration.ReadWrite.All             | Read and write Microsoft Intune Device Configuration and Policies |
+    | DeviceManagementManagedDevices.ReadWrite.All            | Read and write Microsoft Intune devices                           |
+    | DeviceManagementRBAC.ReadWrite.All                      | Read and write Microsoft Intune RBAC settings                     |
+    | DeviceManagementServiceConfig.ReadWrite.All             | Read and write Microsoft Intune configuration                     |
+    | Directory.AccessAsUser.All                              | Access directory as the signed in user                            |
+    | Domain.Read.All                                         | Read domain data                                                  |
+    | Group.ReadWrite.All                                     | Read and write all groups                                         |
+    | GroupMember.ReadWrite.All                               | Read and write group memberships                                  |
+    | Mail.Send                                               | Send mail as a user                                               |
+    | Mail.Send.Shared                                        | Send mail on behalf of others                                     |
+    | Member.Read.Hidden                                      | Read hidden memberships                                           |
+    | Organization.ReadWrite.All                              | Read and write organization information                           |
+    | Policy.Read.All                                         | Read your organization's policies                                 |
+    | Policy.ReadWrite.AuthenticationFlows                    | Read and write authentication flow policies                       |
+    | Policy.ReadWrite.AuthenticationMethod                   | Read and write authentication method policies                     |
+    | Policy.ReadWrite.Authorization                          | Read and write your organization's authorization policy           |
+    | Policy.ReadWrite.ConsentRequest                         | Read and write consent request policy                             |
+    | Policy.ReadWrite.ConditionalAccess                      | Read and write conditional access policy                          |
+    | Policy.ReadWrite.DeviceConfiguration                    | Read and write your organization's device configuration policies  |
+    | PrivilegedAccess.Read.AzureResources                    | Read privileged access to Azure resources                         |
+    | PrivilegedAccess.ReadWrite.AzureResources               | Read and write privileged access to Azure resources               |
+    | OpenID permissions - profile                            | View users' basic profile                                         |
+    | Reports.Read.All                                        | Read all usage reports                                            |
+    | RoleManagement.ReadWrite.Directory                      | Read and write directory RBAC settings                            |
+    | SecurityActions.ReadWrite.All                           | Read and update your organization's security actions              |
+    | SecurityEvents.ReadWrite.All                            | Read and update your organization’s security events               |
+    | ServiceHealth.Read.All                                  | Read service health                                               |
+    | ServiceMessage.Read.All                                 | Read service announcement messages                                |
+    | Sites.ReadWrite.All                                     | Edit or delete items in all site collections                      |
+    | TeamMember.ReadWrite.All                                | Add and remove members from teams                                 |
+    | TeamMember.ReadWriteNonOwnerRole.All                    | Add and remove members with non-owner role for all teams          |
+    | TeamsActivity.Read                                      | Read users' teamwork activity feed                                |
+    | TeamsActivity.Send                                      | Send a teamwork activity as the user                              |
+    | TeamsApp.Read                                           | Read users' installed Teams apps                                  |
+    | TeamsApp.Read.All                                       | Read all installed Teams apps                                     |
+    | TeamsApp.ReadWrite                                      | Manage users' Teams apps                                          |
+    | TeamsApp.ReadWrite.All                                  | Manage all Teams apps                                             |
+    | TeamsAppInstallation.ReadForChat                        | Read installed Teams apps in chats                                |
+    | TeamsAppInstallation.ReadForTeam                        | Read installed Teams apps in teams                                |
+    | TeamsAppInstallation.ReadForUser                        | Read users' installed Teams apps                                  |
+    | TeamsAppInstallation.ReadWriteForChat                   | Manage installed Teams apps in chats                              |
+    | TeamsAppInstallation.ReadWriteForTeam                   | Manage installed Teams apps in teams                              |
+    | TeamsAppInstallation.ReadWriteForUser                   | Manage users' installed Teams apps                                |
+    | TeamsAppInstallation.ReadWriteSelfForChat               | Allow the Teams app to manage itself in chats                     |
+    | TeamsAppInstallation.ReadWriteSelfForTeam               | Allow the app to manage itself in teams                           |
+    | TeamsAppInstallation.ReadWriteSelfForUser               | Allow the Teams app to manage itself for a user                   |
+    | TeamSettings.Read.All                                   | Read teams' settings                                              |
+    | TeamSettings.ReadWrite.All                              | Read and change teams' settings                                   |
+    | TeamsTab.Create                                         | Create tabs in Microsoft Teams                                    |
+    | TeamsTab.Read.All                                       | Read tabs in Microsoft Teams                                      |
+    | TeamsTab.ReadWrite.All                                  | Read and write tabs in Microsoft Teams                            |
+    | TeamsTab.ReadWriteForChat                               | Allow the Teams app to manage all tabs in chats                   |
+    | TeamsTab.ReadWriteForTeam                               | Allow the Teams app to manage all tabs in teams                   |
+    | TeamsTab.ReadWriteForUser                               | Allow the Teams app to manage all tabs for a user                 |
+    | Team.Create                                             | Create teams                                                      |
+    | Team.ReadBasic.All                                      | Read the names and descriptions of teams                          |
+    | ThreatAssessment.ReadWrite.All                          | Read and write threat assessment requests                         |
+    | UnifiedGroupMember.Read.AsGuest                         | Read unified group memberships as guest                           |
+    | User.ManageIdentities.All                               | Manage user identities                                            |
+    | User.Read                                               | Sign in and read user profile                                     |
+    | User.ReadWrite.All                                      | Read and write all users' full profiles                           |
+    | UserAuthenticationMethod.Read.All                       | Read all users' authentication methods                            |
+    | UserAuthenticationMethod.ReadWrite                      | Read and write user authentication methods                        |
+    | UserAuthenticationMethod.ReadWrite.All                  | Read and write all users' authentication methods                  |
 
-| API / Permissions name                                  | Description                                                       |
-| ------------------------------------------------------- | ----------------------------------------------------------------- |
-| Application.Read.All                                    | Read applications                                                 |
-| Application.ReadWrite.All                               | Read and write all applications                                   |
-| AuditLog.Read.All                                       | Read audit log data                                               |
-| Channel.Create                                          | Create channels                                                   |
-| Channel.ReadBasic.All                                   | Read the names and descriptions of channels                       |
-| ChannelMember.Read.All                                  | Read the members of channels                                      |
-| ChannelMember.ReadWrite.All                             | Add and remove members from channels                              |
-| ChannelMessage.Delete                                   | Delete users' channel messages                                    |
-| ChannelMessage.Edit                                     | Edit users' channel messages                                      |
-| ChannelMessage.Read.All                                 | Read users' channel messages                                        |
-| ChannelMessage.Send                                     | Send channel messages                                             |
-| ChannelSettings.Read.All                                | Read the names, descriptions, and settings of channels            |
-| ChannelSettings.ReadWrite.All                           | Read and write the names, descriptions, and settings of channels  |
-| ConsentRequest.Read.All                                 | Read consent requests                                             |
-| Device.Command                                          | Communicate with user devices                                     |
-| Device.Read                                             | Read user devices                                                 |
-| Device.Read.All                                         | Read all devices                                                  |
-| DeviceManagementApps.ReadWrite.All                      | Read and write Microsoft Intune apps                              |
-| DeviceManagementConfiguration.ReadWrite.All             | Read and write Microsoft Intune Device Configuration and Policies |
-| DeviceManagementManagedDevices.ReadWrite.All            | Read and write Microsoft Intune devices                           |
-| DeviceManagementRBAC.ReadWrite.All                      | Read and write Microsoft Intune RBAC settings                     |
-| DeviceManagementServiceConfig.ReadWrite.All             | Read and write Microsoft Intune configuration                     |
-| Directory.AccessAsUser.All                              | Access directory as the signed in user                            |
-| Domain.Read.All                                         | Read domain data                                                  |
-| Group.ReadWrite.All                                     | Read and write all groups                                         |
-| GroupMember.ReadWrite.All                               | Read and write group memberships                                  |
-| Mail.Send                                               | Send mail as a user                                               |
-| Mail.Send.Shared                                        | Send mail on behalf of others                                     |
-| Member.Read.Hidden                                      | Read hidden memberships                                           |
-| Organization.ReadWrite.All                              | Read and write organization information                           |
-| Policy.Read.All                                         | Read your organization's policies                                 |
-| Policy.ReadWrite.AuthenticationFlows                    | Read and write authentication flow policies                       |
-| Policy.ReadWrite.AuthenticationMethod                   | Read and write authentication method policies                     |
-| Policy.ReadWrite.Authorization                          | Read and write your organization's authorization policy           |
-| Policy.ReadWrite.ConsentRequest                         | Read and write consent request policy                             |
-| Policy.ReadWrite.ConditionalAccess                      | Read and write conditional access policy                          |
-| Policy.ReadWrite.DeviceConfiguration                    | Read and write your organization's device configuration policies  |
-| PrivilegedAccess.Read.AzureResources                    | Read privileged access to Azure resources                         |
-| PrivilegedAccess.ReadWrite.AzureResources               | Read and write privileged access to Azure resources               |
-| OpenID permissions - profile                            | View users' basic profile                                         |
-| Reports.Read.All                                        | Read all usage reports                                            |
-| RoleManagement.ReadWrite.Directory                      | Read and write directory RBAC settings                            |
-| SecurityActions.ReadWrite.All                           | Read and update your organization's security actions              |
-| SecurityEvents.ReadWrite.All                            | Read and update your organization’s security events               |
-| ServiceHealth.Read.All                                  | Read service health                                               |
-| ServiceMessage.Read.All                                 | Read service announcement messages                                |
-| Sites.ReadWrite.All                                     | Edit or delete items in all site collections                      |
-| TeamMember.ReadWrite.All                                | Add and remove members from teams                                 |
-| TeamMember.ReadWriteNonOwnerRole.All                    | Add and remove members with non-owner role for all teams          |
-| TeamsActivity.Read                                      | Read users' teamwork activity feed                                |
-| TeamsActivity.Send                                      | Send a teamwork activity as the user                              |
-| TeamsApp.Read                                           | Read users' installed Teams apps                                  |
-| TeamsApp.Read.All                                       | Read all installed Teams apps                                     |
-| TeamsApp.ReadWrite                                      | Manage users' Teams apps                                          |
-| TeamsApp.ReadWrite.All                                  | Manage all Teams apps                                             |
-| TeamsAppInstallation.ReadForChat                        | Read installed Teams apps in chats                                |
-| TeamsAppInstallation.ReadForTeam                        | Read installed Teams apps in teams                                |
-| TeamsAppInstallation.ReadForUser                        | Read users' installed Teams apps                                  |
-| TeamsAppInstallation.ReadWriteForChat                   | Manage installed Teams apps in chats                              |
-| TeamsAppInstallation.ReadWriteForTeam                   | Manage installed Teams apps in teams                              |
-| TeamsAppInstallation.ReadWriteForUser                   | Manage users' installed Teams apps                                |
-| TeamsAppInstallation.ReadWriteSelfForChat               | Allow the Teams app to manage itself in chats                     |
-| TeamsAppInstallation.ReadWriteSelfForTeam               | Allow the app to manage itself in teams                           |
-| TeamsAppInstallation.ReadWriteSelfForUser               | Allow the Teams app to manage itself for a user                   |
-| TeamSettings.Read.All                                   | Read teams' settings                                              |
-| TeamSettings.ReadWrite.All                              | Read and change teams' settings                                   |
-| TeamsTab.Create                                         | Create tabs in Microsoft Teams                                    |
-| TeamsTab.Read.All                                       | Read tabs in Microsoft Teams                                      |
-| TeamsTab.ReadWrite.All                                  | Read and write tabs in Microsoft Teams                            |
-| TeamsTab.ReadWriteForChat                               | Allow the Teams app to manage all tabs in chats                   |
-| TeamsTab.ReadWriteForTeam                               | Allow the Teams app to manage all tabs in teams                   |
-| TeamsTab.ReadWriteForUser                               | Allow the Teams app to manage all tabs for a user                 |
-| Team.Create                                             | Create teams                                                      |
-| Team.ReadBasic.All                                      | Read the names and descriptions of teams                          |
-| ThreatAssessment.ReadWrite.All                          | Read and write threat assessment requests                         |
-| UnifiedGroupMember.Read.AsGuest                         | Read unified group memberships as guest                           |
-| User.ManageIdentities.All                               | Manage user identities                                            |
-| User.Read                                               | Sign in and read user profile                                     |
-| User.ReadWrite.All                                      | Read and write all users' full profiles                           |
-| UserAuthenticationMethod.Read.All                       | Read all users' authentication methods                            |
-| UserAuthenticationMethod.ReadWrite                      | Read and write user authentication methods                        |
-| UserAuthenticationMethod.ReadWrite.All                  | Read and write all users' authentication methods                  |
 
 ### Application Permissions
 
-You'll need to add the following **Application permissions**:
+??? "AND You'll need to add the following **Application permissions**:"
+    | API / Permissions name                                  | Description                                                       |
+    | ------------------------------------------------------- | ----------------------------------------------------------------- |
+    | Channel.Create                                          | Create channels                                                   |
+    | Channel.ReadBasic.All                                   | Read the names and descriptions of channels                       |
+    | ChannelMember.Read.All                                  | Read the members of channels                                      |
+    | ChannelMember.ReadWrite.All                             | Add and remove members from channels                              |
+    | Device.ReadWrite.All                                    | Read and write devices                                            |
+    | DeviceManagementApps.ReadWrite.All                      | Read and write Microsoft Intune apps                              |
+    | DeviceManagementConfiguration.ReadWrite.All             | Read and write Microsoft Intune Device Configuration and Policies |
+    | DeviceManagementManagedDevices.PrivilegedOperations.All | Perform user-impacting remote actions on Microsoft Intune devices |
+    | DeviceManagementManagedDevices.Read.All                 | Read Microsoft Intune devices                                     |
+    | DeviceManagementManagedDevices.ReadWrite.All            | Read and write Microsoft Intune devices                           |
+    | DeviceManagementRBAC.Read.All                           | Read Microsoft Intune RBAC settings                               |
+    | DeviceManagementRBAC.ReadWrite.All                      | Read and write Microsoft Intune RBAC settings                     |
+    | DeviceManagementServiceConfig.Read.All                  | Read Microsoft Intune configuration                               |
+    | DeviceManagementServiceConfig.ReadWrite.All             | Read and write Microsoft Intune configuration                     |
+    | Directory.Read.All                                      | Read directory data                                               |
+    | Group.Create                                            | Create groups                                                     |
+    | Group.Read.All                                          | Read all groups                                                   |
+    | Group.ReadWrite.All                                     | Read and write all groups                                         |
+    | GroupMember.ReadWrite.All                               | Read and write group memberships                                  |
+    | Mail.Send                                               | Send mail as a user                                               |
+    | Organization.ReadWrite.All                              | Read and write organization information                           |
+    | Policy.Read.All                                         | Read your organization's policies                                 |
+    | Policy.ReadWrite.AuthenticationFlows                    | Read and write authentication flow policies                       |
+    | Policy.ReadWrite.AuthenticationMethod                   | Read and write authentication method policies                     |
+    | Policy.ReadWrite.ConsentRequest                         | Read and write consent request policy                             |
+    | Policy.ReadWrite.ConditionalAccess                      | Read and write conditional access policy                          |
+    | PrivilegedAccess.ReadWrite.AzureADGroup                 | Read and write privileged access to Azure AD groups               |
+    | Reports.Read.All                                        | Read all usage reports                                            |
+    | RoleManagement.ReadWrite.Directory                      | Read and write directory RBAC settings                            |
+    | SecurityEvents.Read.All                                 | Read your organization’s security events                          |
+    | Sites.FullControl.All                                   | Have full control of all site collections                         |
+    | Team.ReadBasic.All                                      | Read the names and descriptions of teams                          |
+    | TeamMember.ReadWrite.All                                | Add and remove members from teams                                 |
+    | TeamMember.ReadWriteNonOwnerRole.All                    | Add and remove members with non-owner role for all teams          |
+    | User.ReadWrite.All                                      | Read and write all users' full profiles                           |
+    | UserAuthenticationMethod.ReadWrite.All                  | Read and write all users' authentication methods                  |
 
-| API / Permissions name                                  | Description                                                       |
-| ------------------------------------------------------- | ----------------------------------------------------------------- |
-| Channel.Create                                          | Create channels                                                   |
-| Channel.ReadBasic.All                                   | Read the names and descriptions of channels                       |
-| ChannelMember.Read.All                                  | Read the members of channels                                      |
-| ChannelMember.ReadWrite.All                             | Add and remove members from channels                              |
-| Device.ReadWrite.All                                    | Read and write devices                                            |
-| DeviceManagementApps.ReadWrite.All                      | Read and write Microsoft Intune apps                              |
-| DeviceManagementConfiguration.ReadWrite.All             | Read and write Microsoft Intune Device Configuration and Policies |
-| DeviceManagementManagedDevices.PrivilegedOperations.All | Perform user-impacting remote actions on Microsoft Intune devices |
-| DeviceManagementManagedDevices.Read.All                 | Read Microsoft Intune devices                                     |
-| DeviceManagementManagedDevices.ReadWrite.All            | Read and write Microsoft Intune devices                           |
-| DeviceManagementRBAC.Read.All                           | Read Microsoft Intune RBAC settings                               |
-| DeviceManagementRBAC.ReadWrite.All                      | Read and write Microsoft Intune RBAC settings                     |
-| DeviceManagementServiceConfig.Read.All                  | Read Microsoft Intune configuration                               |
-| DeviceManagementServiceConfig.ReadWrite.All             | Read and write Microsoft Intune configuration                     |
-| Directory.Read.All                                      | Read directory data                                               |
-| Group.Create                                            | Create groups                                                     |
-| Group.Read.All                                          | Read all groups                                                   |
-| Group.ReadWrite.All                                     | Read and write all groups                                         |
-| GroupMember.ReadWrite.All                               | Read and write group memberships                                  |
-| Mail.Send                                               | Send mail as a user                                               |
-| Organization.ReadWrite.All                              | Read and write organization information                           |
-| Policy.Read.All                                         | Read your organization's policies                                 |
-| Policy.ReadWrite.AuthenticationFlows                    | Read and write authentication flow policies                       |
-| Policy.ReadWrite.AuthenticationMethod                   | Read and write authentication method policies                     |
-| Policy.ReadWrite.ConsentRequest                         | Read and write consent request policy                             |
-| Policy.ReadWrite.ConditionalAccess                      | Read and write conditional access policy                          |
-| PrivilegedAccess.ReadWrite.AzureADGroup                 | Read and write privileged access to Azure AD groups               |
-| Reports.Read.All                                        | Read all usage reports                                            |
-| RoleManagement.ReadWrite.Directory                      | Read and write directory RBAC settings                            |
-| SecurityEvents.Read.All                                 | Read your organization’s security events                          |
-| Sites.FullControl.All                                   | Have full control of all site collections                         |
-| Team.ReadBasic.All                                      | Read the names and descriptions of teams                          |
-| TeamMember.ReadWrite.All                                | Add and remove members from teams                                 |
-| TeamMember.ReadWriteNonOwnerRole.All                    | Add and remove members with non-owner role for all teams          |
-| User.ReadWrite.All                                      | Read and write all users' full profiles                           |
-| UserAuthenticationMethod.ReadWrite.All                  | Read and write all users' authentication methods                  |
 
 ## Getting started with CIPP
 
